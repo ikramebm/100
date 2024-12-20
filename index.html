@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Streaming ESP32-CAM</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            text-align: center;
+        }
+        #videoCanvas {
+            max-width: 100%;
+            background-color: #f0f0f0;
+            border: 1px solid #ccc;
+        }
+        button {
+            margin: 0 10px;
+            padding: 10px 15px;
+        }
+        #startStream {
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        #stopStream {
+            background-color: #f44336;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #ipInfo {
+            margin: 20px 0;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Récepteur de Flux Vidéo</h1>
+    <div id="ipInfo">
+        <p>Vérification de l'adresse IP publique...</p>
+    </div>
+    <div>
+        <button id="startStream">Démarrer Stream</button>
+        <button id="stopStream" disabled>Arrêter Stream</button>
+        <canvas id="videoCanvas" width="640" height="480"></canvas>
+    </div>
+
+    <script>
+        // Configuration UDP et variables pour le buffer vidéo
+        const UDP_PORT = 12345;
+        let frameBuffer = new Map();
+        let nextFrameIndex = 0;
+
+        // Fonction pour traiter les paquets vidéo reçus
+        function handleVideoPacket(data) {
+            const view = new DataView(data);
+            const frameIndex = view.getUint32(0);
+            const packetIndex = view.getUint32(4);
+            
+            // Récupérer ou créer le buffer pour cette frame
+            if (!frameBuffer.has(frameIndex)) {
+                frameBuffer.set(frameIndex, new Map());
+            }
+            
+            // Stocker ce paquet
+            const frameData = frameBuffer.get(frameIndex);
+            frameData.set(packetIndex, new Uint8Array(data.slice(8)));
+            
+            // Vérifier si c'est la dernière partie de la frame
+            let isComplete = true;
+            let totalLength = 0;
+            frameData.forEach(packet => {
+                totalLength += packet.length;
+            });
+            
+            // Si la frame est complète
+            if (isComplete && frameIndex === nextFrameIndex) {
+                // Assembler la frame complète
+                const fullFrame = new Uint8Array(totalLength);
+                let offset = 0;
+                frameData.forEach(packet => {
+                    fullFrame.set(packet, offset);
+                    offset += packet.length;
+                });
+                
+                // Créer un blob et l'afficher
+                const blob = new Blob([fullFrame], { type: 'image/jpeg' });
+                const url = URL.createObjectURL(blob);
+                const img = new Image();
+                img.onload = () => {
+                    const ctx = videoCanvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, videoCanvas.width, videoCanvas.height);
+                    URL.revokeObjectURL(url);
+                };
+                img.src = url;
+                
+                // Nettoyer le buffer
+                frameBuffer.delete(frameIndex);
+                nextFrameIndex = frameIndex + 1;
+                
+                // Nettoyer les vieilles frames
+                for (let [idx] of frameBuffer) {
+                    if (idx < frameIndex - 30) { // Garder seulement les 30 dernières frames
+                        frameBuffer.delete(idx);
+                    }
+                }
+            }
+        }
+
+        // Vérification de l'IP publique
+        fetch('https://api.ipify.org?format=json')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('ipInfo').innerHTML = `
+                    <p>IP publique: ${data.ip}</p>
+                    <p>Port UDP: ${UDP_PORT}</p>
+                `;
+            })
+            .catch(error => {
+                document.getElementById('ipInfo').innerHTML = `
+                    <p>Erreur lors de la récupération de l'IP publique</p>
+                    <p>Port UDP: ${UDP_PORT}</p>
+                `;
+            });
+
+        const ice_servers = {
+            urls: ['turn:ikrame-s-websocket-server.glitch.me:3478'],
+            username: "admin",
+            credential: "admin"
+        };
+
+        const socket = new WebSocket('wss://ikrame-s-websocket-server.glitch.me');
+        let peerConnection = null;
+        const videoCanvas = document.getElementById('videoCanvas');
+        const startButton = document.getElementById('startStream');
+        const stopButton = document.getElementById('stopStream');
+
+        socket.onopen = () => {
+            socket.send(JSON.stringify({
+                type: 'register-web',
+                udpPort: UDP_PORT
+            }));
+        };
+
+        startButton.addEventListener('click', () => {
+            console.log('Démarrage du stream demandé');
+            initializePeerConnection();
+            socket.send(JSON.stringify({type: 'start-stream'}));
+            startButton.disabled = true;
+            stopButton.disabled = false;
+        });
+
+        stopButton.addEventListener('click', () => {
+            socket.send(JSON.stringify({type: 'stop-stream'}));
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            const ctx = videoCanvas.getContext('2d');
+            ctx.clearRect(0, 0, videoCanvas.width, videoCanvas.height);
+            startButton.disabled = false;
+            stopButton.disabled = true;
+        });
+
+        function initializePeerConnection() {
+            if (peerConnection) {
+                peerConnection.close();
+            }
+
+            peerConnection = new RTCPeerConnection({
+                iceServers: [ice_servers]
+            });
+
+            peerConnection.ontrack = (event) => {
+                console.log('Track reçu:', event);
+                // Les données vidéo seront traitées via handleVideoPacket
+            };
+
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.send(JSON.stringify({
+                        type: 'webrtc-ice-candidate',
+                        candidate: event.candidate
+                    }));
+                }
+            };
+
+            peerConnection.oniceconnectionstatechange = () => {
+                if (peerConnection.iceConnectionState === 'disconnected') {
+                    const ctx = videoCanvas.getContext('2d');
+                    ctx.clearRect(0, 0, videoCanvas.width, videoCanvas.height);
+                    startButton.disabled = false;
+                    stopButton.disabled = true;
+                }
+            };
+        }
+
+        socket.addEventListener('message', async (event) => {
+            const message = JSON.parse(event.data);
+            console.log('Message reçu:', message);
+
+            if (message.type === 'webrtc-offer') {
+                if (!peerConnection) {
+                    initializePeerConnection();
+                }
+                
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(message.offer));
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+
+                socket.send(JSON.stringify({
+                    type: 'webrtc-answer',
+                    answer: answer
+                }));
+            } 
+            else if (message.type === 'webrtc-ice-candidate' && message.candidate) {
+                try {
+                    if (peerConnection) {
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+                    }
+                } catch (error) {
+                    console.error('Erreur lors de l\'ajout du candidat ICE:', error);
+                }
+            }
+            else if (message.type === 'video-data') {
+                handleVideoPacket(message.data);
+            }
+        });
+    </script>
+</body>
+</html>
